@@ -1,6 +1,7 @@
 import serial
 from serial.tools import list_ports
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 import time
 import threading
@@ -27,6 +28,8 @@ trigger_hold = False  # when True, buffer is not popped/cleared
 class SignalEmitter(QObject):
     log_signal = pyqtSignal(str)
     plot_signal = pyqtSignal()
+    # Emitted when trigger snapshot is ready: (timestamps_list, signals_list)
+    trigger_snapshot = pyqtSignal(object, object)
 
 emitter = SignalEmitter()
 
@@ -56,6 +59,9 @@ def read_serial_data(ser):
     emitter.log_signal.emit("Serial-Lese-Thread gestartet...")
     byte_buf = b''
     processed = 0
+    collecting_snapshot = False
+    snapshot_ts = []
+    snapshot_sig = []
 
     while running:
         try:
@@ -90,10 +96,35 @@ def read_serial_data(ser):
                             try:
                                 if trigger_enabled and (not trigger_hold) and (signal_mv > float(trigger_threshold)):
                                     trigger_hold = True
-                                    emitter.log_signal.emit(f"▶ Trigger ausgelöst bei {signal_mv} (Schwelle {trigger_threshold}) - Buffer wird nun nicht mehr geleert")
+                                    # Start collecting a snapshot: the triggering sample + next BUFFER_SIZE samples
+                                    collecting_snapshot = True
+                                    snapshot_ts = [time_ns]
+                                    snapshot_sig = [signal_mv]
+                                    emitter.log_signal.emit(f"▶ Trigger ausgelöst bei {signal_mv} (Schwelle {trigger_threshold}) - Aufnahme von Snapshot wird gestartet")
                             except Exception:
                                 # ignore invalid threshold
                                 pass
+
+                            # If currently collecting snapshot, append new samples until we have BUFFER_SIZE+1
+                            if collecting_snapshot and not (len(snapshot_sig) >= (1 + BUFFER_SIZE)):
+                                # Note: we already appended the current sample above; if collecting continues,
+                                # subsequent iterations will append here when new samples arrive.
+                                # (For the triggering sample this block will be skipped because it's already in snapshot)
+                                if not (len(snapshot_sig) >= (1 + BUFFER_SIZE)):
+                                    # ensure we don't double-append the triggering sample
+                                    if not (len(snapshot_sig) == 1 and snapshot_sig[0] == signal_mv and snapshot_ts[0] == time_ns):
+                                        snapshot_ts.append(time_ns)
+                                        snapshot_sig.append(signal_mv)
+
+                            # If we've collected enough samples, emit snapshot and stop collecting
+                            if collecting_snapshot and len(snapshot_sig) >= (1 + BUFFER_SIZE):
+                                try:
+                                    # Emit copies so the GUI gets an independent list
+                                    emitter.trigger_snapshot.emit(list(snapshot_ts), list(snapshot_sig))
+                                    emitter.log_signal.emit(f"▶ Snapshot ready ({len(snapshot_sig)} samples) - Fenster wird geöffnet")
+                                except Exception as e:
+                                    emitter.log_signal.emit(f"Fehler beim Senden des Snapshots: {e}")
+                                collecting_snapshot = False
 
                             # Only pop oldest if not in trigger hold
                             if (not trigger_hold) and len(timestamps) > BUFFER_SIZE:
@@ -126,10 +157,55 @@ def send_command_to_pico(command):
     else:
         emitter.log_signal.emit("Fehler: Serieller Port nicht geöffnet!")
 
+
+class SnapshotWindow(QMainWindow):
+    """Window to display a snapshot (triggering sample + next BUFFER_SIZE samples)."""
+    def __init__(self, ts_list, sig_list):
+        super().__init__()
+        self.setWindowTitle('Trigger Snapshot')
+        self.setGeometry(200, 200, 1000, 600)
+
+        central = QWidget()
+        layout = QVBoxLayout()
+
+        self.figure = Figure(figsize=(8, 5), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+
+        # Navigation toolbar for zoom/pan
+        try:
+            toolbar = NavigationToolbar(self.canvas, self)
+            layout.addWidget(toolbar)
+        except Exception:
+            # If toolbar not available, continue without it
+            pass
+
+        layout.addWidget(self.canvas)
+
+        central.setLayout(layout)
+        self.setCentralWidget(central)
+
+        # Plot provided data
+        try:
+            self.ax.plot(ts_list, sig_list, 'b-', linewidth=1)
+            self.ax.set_title(f'Trigger Snapshot - {len(sig_list)} samples')
+            self.ax.set_xlabel('Zeit (ns)')
+            self.ax.set_ylabel('Signal (mV)')
+            self.ax.grid(True, alpha=0.3)
+            if len(ts_list) > 0:
+                self.ax.set_xlim([min(ts_list), max(ts_list)])
+            if len(sig_list) > 0:
+                self.ax.set_ylim([min(sig_list) - 10, max(sig_list) + 10])
+            self.canvas.draw()
+        except Exception as e:
+            emitter.log_signal.emit(f"Fehler beim Zeichnen des Snapshots: {e}")
+
 class PicoVisualizerApp(QMainWindow):
     def __init__(self, ser_port):
         super().__init__()
         self.ser = ser_port
+        # Keep references to any snapshot windows to avoid GC closing them
+        self.snapshot_windows = []
         self.update_counter = 0  # Counter für update_plot Aufrufe
         self.initUI()
         self.setup_plot_update()
@@ -232,6 +308,17 @@ class PicoVisualizerApp(QMainWindow):
         
         emitter.log_signal.connect(self.append_log)
         emitter.plot_signal.connect(self.update_plot)
+        emitter.trigger_snapshot.connect(self.open_snapshot_window)
+
+    def open_snapshot_window(self, ts_list, sig_list):
+        """Open a new window displaying the given timestamp/signal snapshot."""
+        try:
+            win = SnapshotWindow(ts_list, sig_list)
+            self.snapshot_windows.append(win)
+            win.show()
+            emitter.log_signal.emit("Snapshot-Fenster geöffnet.")
+        except Exception as e:
+            emitter.log_signal.emit(f"Fehler beim Öffnen des Snapshot-Fensters: {e}")
     
     def send_command(self):
         command = self.cmd_input.text().strip()
