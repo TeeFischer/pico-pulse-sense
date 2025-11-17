@@ -1,12 +1,12 @@
 import serial
 from serial.tools import list_ports
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.io as pio
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 import time
 import threading
 
-BUFFER_SIZE = 1000  # oder ein anderer Wert je nach Bedarf
+BUFFER_SIZE = 10000  # oder ein anderer Wert je nach Bedarf
+plot_interval = 300  # in Millisekunden
 
 # Globale Variablen für Threading
 timestamps = []
@@ -57,8 +57,6 @@ def read_serial_data(ser):
                             timestamps.append(time_ns)
                             signals.append(signal_mv)
                             
-                            print(f"Zeit: {time_ns} ns, Signal: {signal_mv} mV")
-                            
                             # Wenn der Puffer voll ist, älteste Daten löschen
                             if len(timestamps) > BUFFER_SIZE:
                                 timestamps.pop(0)
@@ -72,32 +70,30 @@ def read_serial_data(ser):
     
     print("Serial-Lese-Thread beendet.")
 
-# Funktion zum Aktualisieren des Plots in regelmäßigen Abständen
-def update_plot(fig, update_interval=1.0):
-    global timestamps, signals, running
-    print(f"Plot-Update-Thread gestartet (Interval: {update_interval}s)...")
+# Funktion zum Aktualisieren des Plots mit Animation
+def update_plot_animation(frame):
+    global timestamps, signals
     
-    while running:
-        try:
-            time.sleep(update_interval)
+    with data_lock:
+        if timestamps and signals:
+            # Leere den Plot
+            ax.clear()
             
-            with data_lock:
-                if timestamps and signals:
-                    # Die Daten im Plot aktualisieren
-                    fig.data[0].x = list(timestamps)
-                    fig.data[0].y = list(signals)
-                    fig.update_layout(
-                        xaxis=dict(range=[min(timestamps), max(timestamps)]),
-                        yaxis=dict(range=[min(signals) - 10, max(signals) + 10])
-                    )
-                    # Redraw im Browser mit plotly
-                    pio.write_html(fig, 'plot.html')
-                    print(f"Plot aktualisiert - Datenpunkte: {len(timestamps)}")
-        
-        except Exception as e:
-            print(f"Fehler beim Plot-Update: {e}")
-    
-    print("Plot-Update-Thread beendet.")
+            # Zeichne die neuen Daten
+            ax.plot(timestamps, signals, 'b-', linewidth=1, label='Messwerte')
+            ax.set_xlabel('Zeit (ns)')
+            ax.set_ylabel('Signal (mV)')
+            ax.set_title('Live Messdaten')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            
+            # X- und Y-Achse anpassen
+            if len(timestamps) > 0:
+                ax.set_xlim([min(timestamps), max(timestamps)])
+            if len(signals) > 0:
+                ax.set_ylim([min(signals) - 10, max(signals) + 10])
+            
+            print(f"Plot aktualisiert - Datenpunkte: {len(timestamps)}")
 
 # Alle verfügbaren Ports auflisten
 ports = list_serial_ports()
@@ -126,38 +122,30 @@ if ports:
     
     # Port öffnen, falls gefunden
     if com_port:
-        baud_rate = 9600  # Beispiel-Baudrate
+        baud_rate = 115200  # Beispiel-Baudrate
         ser = open_serial_port(com_port, baud_rate)
 
-# Initialisierung der Plotly-Figur
-fig = go.Figure()
+# Initialisierung der Matplotlib-Figur
+fig, ax = plt.subplots(figsize=(12, 6))
 
 # X- und Y-Datenpuffer (bereits oben definiert als globale Variablen)
 
 # Plot-Layout anpassen
-fig.update_layout(
-    title='Live Messdaten',
-    xaxis_title='Zeit (ns)',
-    yaxis_title='Signal (mV)',
-    template='plotly_dark',
-    xaxis_rangeslider_visible=True,
-    showlegend=True
-)
-
-# Plotly-Trace für die Daten
-trace = go.Scatter(x=timestamps, y=signals, mode='lines+markers', name='Messwerte')
-fig.add_trace(trace)
-
-# Plot in Browser öffnen (nur einmalig)
-fig.show()
+ax.set_title('Live Messdaten')
+ax.set_xlabel('Zeit (ns)')
+ax.set_ylabel('Signal (mV)')
+ax.grid(True, alpha=0.3)
 
 # Threads starten
 print("Starte Datenerfassung und Plot-Aktualisierung...")
 serial_thread = threading.Thread(target=read_serial_data, args=(ser,), daemon=True)
-plot_thread = threading.Thread(target=update_plot, args=(fig, 1.0), daemon=True)  # Plot alle 1 Sekunde aktualisieren
-
 serial_thread.start()
-plot_thread.start()
+
+# Matplotlib Animation für Plot-Updates (alle 1000ms = 1 Sekunde)
+ani = animation.FuncAnimation(fig, update_plot_animation, interval=plot_interval, blit=False)
+
+# Zeige den Plot
+plt.show()
 
 # Hauptschleife - warte auf Benutzer-Eingabe zum Beenden
 try:
