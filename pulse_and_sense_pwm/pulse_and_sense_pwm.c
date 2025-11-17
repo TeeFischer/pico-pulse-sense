@@ -73,6 +73,7 @@ int main() {
 
                 // PWM starten
                 if (duty_percent > 0) {
+                    gpio_set_function(PULSE_PIN, GPIO_FUNC_PWM);
                     uint16_t level = (wrap * duty_percent) / 100;
                     pwm_set_chan_level(slice_num, channel, level);
                     pwm_set_enabled(slice_num, true);
@@ -94,36 +95,21 @@ int main() {
         // --- Puls beenden ---
         if (pulse.active && (time_us_32() - pulse.start_us) >= PULSE_DURATION_MS * 1000) {
             pwm_set_enabled(slice_num, false);
+            gpio_set_function(PULSE_PIN, GPIO_FUNC_SIO);
+            gpio_set_dir(PULSE_PIN, GPIO_OUT);
+            gpio_put(PULSE_PIN, 0);
             pulse.active = false;
             printf("PWM beendet!\n");
         }
 
-        // --- ADC-Messung ---
-        uint16_t samples[NUM_SAMPLES];
-        uint32_t timestamps[NUM_SAMPLES];
-        for (int i = 0; i < NUM_SAMPLES; i++) {
-            timestamps[i] = time_us_32();
-            samples[i] = adc_read();
-        }
+    // --- ADC-Messung (einzelne Messung) ---
+    uint16_t sample = adc_read();
+    // Zeitpunkt der Messung (in us) erfassen 
+    uint32_t t_us = time_us_32();
+    float voltage = (float)sample * VperDev;
 
-        // --- Messwerte auswerten ---
-        uint32_t sum = 0;
-        uint16_t max_val = 0;
-        uint16_t min_val = 4095;
+    // Ausgabe: Spannung (V), Messzeit (us)
+    printf(" %llu, %.2f\n",(unsigned long long)t_us, voltage);
 
-        for (int i = 0; i < NUM_SAMPLES; i++) {
-            uint16_t val = samples[i];
-            sum += val;
-            if (val > max_val) max_val = val;
-            if (val < min_val) min_val = val;
-        }
-
-        float avg = (float)sum / NUM_SAMPLES * VperDev;
-        float max_v = (float)max_val * VperDev;
-        float min_v = (float)min_val * VperDev;
-
-        printf("%.2f, %.2f, %.2f\n", avg, max_v, min_v);
-
-        sleep_ms(1);
     }
 }
