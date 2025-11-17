@@ -38,42 +38,66 @@ def list_serial_ports():
 
 def open_serial_port(com_port, baud_rate):
     try:
-        ser = serial.Serial(com_port, baud_rate, timeout=1)
+        # non-blocking reads; wir handhaben Fragments selbst
+        ser = serial.Serial(com_port, baud_rate, timeout=0)
         print(f"Verbindung zu {com_port} hergestellt.")
         return ser
     except serial.SerialException as e:
         print(f"Fehler beim Öffnen des Ports {com_port}: {e}")
         return None
-
+# ...existing code...
 def read_serial_data(ser):
     global timestamps, signals, running
     emitter.log_signal.emit("Serial-Lese-Thread gestartet...")
-    
+    byte_buf = b''
+    processed = 0
+
     while running:
         try:
             if ser and ser.is_open:
-                line = ser.readline().decode('utf-8').strip()
-                
-                if line:
+                # Lese alle momentan verfügbaren Bytes (non-blocking)
+                to_read = ser.in_waiting or 1
+                data = ser.read(to_read)
+                if not data:
+                    time.sleep(0.001)
+                    continue
+
+                byte_buf += data
+
+                # Splitte auf '\n' (handle auch '\r\n')
+                while b'\n' in byte_buf:
+                    line_bytes, byte_buf = byte_buf.split(b'\n', 1)
+                    # entferne \r und decode, ersetze invalid bytes
+                    line = line_bytes.replace(b'\r', b'').decode('utf-8', errors='replace').strip()
+                    if not line:
+                        continue
+
                     try:
-                        time_ns, signal_mv = map(float, line.split(','))
-                        
+                        # Erwartetes Format: "time_ns,signal_mv"
+                        time_ns_str, signal_mv_str = map(str.strip, line.split(',', 1))
+                        time_ns = float(time_ns_str)
+                        signal_mv = float(signal_mv_str)
+
                         with data_lock:
                             timestamps.append(time_ns)
                             signals.append(signal_mv)
-                            
                             if len(timestamps) > BUFFER_SIZE:
                                 timestamps.pop(0)
                                 signals.pop(0)
-                    
+
+                        processed += 1
+                        if processed % 50 == 0:
+                            emitter.log_signal.emit(f"✓ Daten verarbeitet: {processed} (puffer: {len(timestamps)})")
+
                     except ValueError:
-                        emitter.log_signal.emit(f"Empfangen: {line}")
+                        # Logge die rohe Zeile zur Analyse, versuche keine weitere Zerlegung hier
+                        emitter.log_signal.emit(f"⚠ Unparsable Zeile: '{line}'")
                     except Exception as e:
-                        emitter.log_signal.emit(f"Fehler beim Verarbeiten: {line} ({e})")
+                        emitter.log_signal.emit(f"Fehler beim Verarbeiten: '{line}' ({e})")
         except Exception as e:
             emitter.log_signal.emit(f"Fehler beim Lesen: {e}")
             break
-    
+
     emitter.log_signal.emit("Serial-Lese-Thread beendet.")
 
 def send_command_to_pico(command):
