@@ -27,10 +27,15 @@ int main() {
     uint channel = pwm_gpio_to_channel(PULSE_PIN);
 
     // PWM-Frequenz einstellen
-    // PWM-Frequenz = clock / (wrap + 1) / divider
-    // z. B. 125 MHz / (125000 / 1) = 1 kHz
-    uint32_t clock = 125000000; // 125 MHz default clock
-    uint32_t wrap = 125000;     // bei divider=1 -> 1 kHz
+    // Systemtakt normalerweise 125 MHz
+    const float sys_clk = 125000000;
+    float freq = 4000.0f;                 // Gewünschte Puls-Frequenz
+    // Clock divider: z.B. CLKDIV = 125, um Zählerfrequenz 1 MHz zu erhalten
+    float clkdiv = 125.0f;
+
+    // Wrap Wert berechnen: Wrap = (PWM_Takt / freq) - 1
+    uint16_t wrap = (uint16_t)((sys_clk / clkdiv) / freq) - 1;
+
     pwm_set_wrap(slice_num, wrap);
     pwm_set_clkdiv(slice_num, 1.0f);
     pwm_set_enabled(slice_num, false);
