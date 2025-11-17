@@ -19,6 +19,11 @@ running = True
 data_lock = threading.Lock()
 ser = None
 
+# Trigger globals
+trigger_enabled = False
+trigger_threshold = 200.0  # default threshold (mV)
+trigger_hold = False  # when True, buffer is not popped/cleared
+
 class SignalEmitter(QObject):
     log_signal = pyqtSignal(str)
     plot_signal = pyqtSignal()
@@ -47,7 +52,7 @@ def open_serial_port(com_port, baud_rate):
         return None
 # ...existing code...
 def read_serial_data(ser):
-    global timestamps, signals, running
+    global timestamps, signals, running, trigger_enabled, trigger_threshold, trigger_hold
     emitter.log_signal.emit("Serial-Lese-Thread gestartet...")
     byte_buf = b''
     processed = 0
@@ -81,7 +86,17 @@ def read_serial_data(ser):
                         with data_lock:
                             timestamps.append(time_ns)
                             signals.append(signal_mv)
-                            if len(timestamps) > BUFFER_SIZE:
+                            # Trigger detection: if enabled and not yet in hold
+                            try:
+                                if trigger_enabled and (not trigger_hold) and (signal_mv > float(trigger_threshold)):
+                                    trigger_hold = True
+                                    emitter.log_signal.emit(f"▶ Trigger ausgelöst bei {signal_mv} (Schwelle {trigger_threshold}) - Buffer wird nun nicht mehr geleert")
+                            except Exception:
+                                # ignore invalid threshold
+                                pass
+
+                            # Only pop oldest if not in trigger hold
+                            if (not trigger_hold) and len(timestamps) > BUFFER_SIZE:
                                 timestamps.pop(0)
                                 signals.pop(0)
 
@@ -186,6 +201,28 @@ class PicoVisualizerApp(QMainWindow):
         btn_layout.addWidget(btn3)
         
         right_layout.addLayout(btn_layout)
+
+        # Trigger controls
+        trig_hbox = QHBoxLayout()
+        trig_label = QLabel('Trigger Schwelle (mV):')
+        trig_label.setFont(QFont('Arial', 9))
+        trig_hbox.addWidget(trig_label)
+
+        self.trig_input = QLineEdit()
+        self.trig_input.setText(str(trigger_threshold))
+        self.trig_input.setFixedWidth(80)
+        trig_hbox.addWidget(self.trig_input)
+
+        self.trig_btn = QPushButton('Trigger: OFF')
+        self.trig_btn.setCheckable(True)
+        self.trig_btn.clicked.connect(self.toggle_trigger)
+        trig_hbox.addWidget(self.trig_btn)
+
+        self.trig_release_btn = QPushButton('Release Hold')
+        self.trig_release_btn.clicked.connect(self.release_trigger)
+        trig_hbox.addWidget(self.trig_release_btn)
+
+        right_layout.addLayout(trig_hbox)
         right_layout.addStretch()
         
         main_layout.addLayout(left_layout, 2)
@@ -204,6 +241,40 @@ class PicoVisualizerApp(QMainWindow):
     
     def send_predefined_command(self, command):
         send_command_to_pico(command)
+
+    def toggle_trigger(self):
+        """Toggle trigger enabled/disabled and set threshold from input."""
+        global trigger_enabled, trigger_threshold, trigger_hold
+        if self.trig_btn.isChecked():
+            # Enable trigger
+            try:
+                val = float(self.trig_input.text())
+                trigger_threshold = val
+            except Exception:
+                emitter.log_signal.emit(f"Ungültige Schwelle: '{self.trig_input.text()}'")
+                # reset button
+                self.trig_btn.setChecked(False)
+                return
+
+            trigger_enabled = True
+            trigger_hold = False
+            self.trig_btn.setText('Trigger: ON')
+            emitter.log_signal.emit(f"Trigger aktiviert. Schwelle = {trigger_threshold} mV")
+        else:
+            # Disable trigger and clear hold
+            trigger_enabled = False
+            trigger_hold = False
+            self.trig_btn.setText('Trigger: OFF')
+            emitter.log_signal.emit("Trigger deaktiviert.")
+
+    def release_trigger(self):
+        """Release trigger hold so buffer popping resumes."""
+        global trigger_hold
+        if trigger_hold:
+            trigger_hold = False
+            emitter.log_signal.emit("Trigger-Hold freigegeben. Buffer wird wieder normal geleert.")
+        else:
+            emitter.log_signal.emit("Trigger-Hold ist nicht aktiv.")
     
     def append_log(self, message):
         self.log_text.append(message)
