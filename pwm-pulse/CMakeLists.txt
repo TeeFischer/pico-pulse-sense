@@ -46,7 +46,10 @@ pico_enable_stdio_usb(pwm-pulse 1)
 
 # Add the standard library to the build
 target_link_libraries(pwm-pulse
-        pico_stdlib)
+        pico_stdlib
+        hardware_adc
+        hardware_pwm
+        pico_multicore)
 
 # Add the standard include files to the build
 target_include_directories(pwm-pulse PRIVATE
