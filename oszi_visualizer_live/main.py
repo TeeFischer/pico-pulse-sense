@@ -12,13 +12,18 @@ from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QFont
 
 BUFFER_SIZE = 10000
-PLOT_INTERVAL = 300
+PLOT_INTERVAL = 300  # in ms
+PRE_TRIGGER = 100  # number of samples to include before the trigger
 
 timestamps = []
 signals = []
 running = True
 data_lock = threading.Lock()
 ser = None
+
+# Tracking for sample rate calculation
+processed_since_last_update = 0
+last_update_time = time.time()
 
 # Trigger globals
 trigger_enabled = False
@@ -55,13 +60,14 @@ def open_serial_port(com_port, baud_rate):
         return None
 # ...existing code...
 def read_serial_data(ser):
-    global timestamps, signals, running, trigger_enabled, trigger_threshold, trigger_hold
+    global timestamps, signals, running, trigger_enabled, trigger_threshold, trigger_hold, processed_since_last_update
     emitter.log_signal.emit("Serial-Lese-Thread gestartet...")
     byte_buf = b''
     processed = 0
     collecting_snapshot = False
     snapshot_ts = []
     snapshot_sig = []
+    snapshot_target_len = None
 
     while running:
         try:
@@ -96,35 +102,37 @@ def read_serial_data(ser):
                             try:
                                 if trigger_enabled and (not trigger_hold) and (signal_mv > float(trigger_threshold)):
                                     trigger_hold = True
-                                    # Start collecting a snapshot: the triggering sample + next BUFFER_SIZE samples
+                                    # Capture up to PRE_TRIGGER samples before the trigger plus the triggering sample
+                                    pre_available = max(0, len(timestamps) - 1)  # exclude current sample at end
+                                    pre_count = PRE_TRIGGER if pre_available >= PRE_TRIGGER else pre_available
+                                    start_idx = max(0, len(timestamps) - 1 - pre_count)
+                                    # slice from start_idx to end to include pre samples and current sample
+                                    snapshot_ts = timestamps[start_idx:]
+                                    snapshot_sig = signals[start_idx:]
+                                    # Set target length: pre_count + 1 (trigger) + BUFFER_SIZE (following samples)
+                                    snapshot_target_len = len(snapshot_sig) + BUFFER_SIZE
                                     collecting_snapshot = True
-                                    snapshot_ts = [time_ns]
-                                    snapshot_sig = [signal_mv]
-                                    emitter.log_signal.emit(f"▶ Trigger ausgelöst bei {signal_mv} (Schwelle {trigger_threshold}) - Aufnahme von Snapshot wird gestartet")
+                                    emitter.log_signal.emit(f"▶ Trigger ausgelöst bei {signal_mv} (Schwelle {trigger_threshold}) - Snapshot startet mit {len(snapshot_sig)} Pre-Samples; Ziel: {snapshot_target_len} samples")
                             except Exception:
-                                # ignore invalid threshold
+                                # ignore invalid threshold or other errors
                                 pass
 
-                            # If currently collecting snapshot, append new samples until we have BUFFER_SIZE+1
-                            if collecting_snapshot and not (len(snapshot_sig) >= (1 + BUFFER_SIZE)):
-                                # Note: we already appended the current sample above; if collecting continues,
-                                # subsequent iterations will append here when new samples arrive.
-                                # (For the triggering sample this block will be skipped because it's already in snapshot)
-                                if not (len(snapshot_sig) >= (1 + BUFFER_SIZE)):
-                                    # ensure we don't double-append the triggering sample
-                                    if not (len(snapshot_sig) == 1 and snapshot_sig[0] == signal_mv and snapshot_ts[0] == time_ns):
-                                        snapshot_ts.append(time_ns)
-                                        snapshot_sig.append(signal_mv)
+                            # If currently collecting snapshot, append new incoming samples until target length reached
+                            if collecting_snapshot:
+                                # snapshot lists already contain current and pre samples; further incoming samples are appended here
+                                if len(snapshot_sig) < snapshot_target_len:
+                                    snapshot_ts.append(time_ns)
+                                    snapshot_sig.append(signal_mv)
 
                             # If we've collected enough samples, emit snapshot and stop collecting
-                            if collecting_snapshot and len(snapshot_sig) >= (1 + BUFFER_SIZE):
+                            if collecting_snapshot and snapshot_target_len is not None and len(snapshot_sig) >= snapshot_target_len:
                                 try:
-                                    # Emit copies so the GUI gets an independent list
                                     emitter.trigger_snapshot.emit(list(snapshot_ts), list(snapshot_sig))
                                     emitter.log_signal.emit(f"▶ Snapshot ready ({len(snapshot_sig)} samples) - Fenster wird geöffnet")
                                 except Exception as e:
                                     emitter.log_signal.emit(f"Fehler beim Senden des Snapshots: {e}")
                                 collecting_snapshot = False
+                                snapshot_target_len = None
 
                             # Only pop oldest if not in trigger hold
                             if (not trigger_hold) and len(timestamps) > BUFFER_SIZE:
@@ -132,8 +140,9 @@ def read_serial_data(ser):
                                 signals.pop(0)
 
                         processed += 1
-                        if processed % 50 == 0:
-                            emitter.log_signal.emit(f"✓ Daten verarbeitet: {processed} (puffer: {len(timestamps)})")
+                        processed_since_last_update += 1
+                        # if processed % 50 == 0:
+                        #     emitter.log_signal.emit(f"✓ Daten verarbeitet: {processed} (puffer: {len(timestamps)})")
 
                     except ValueError:
                         # Logge die rohe Zeile zur Analyse, versuche keine weitere Zerlegung hier
@@ -267,6 +276,14 @@ class PicoVisualizerApp(QMainWindow):
         btn1 = QPushButton('Enter')
         btn1.clicked.connect(lambda: self.send_predefined_command(' '))
         btn_layout.addWidget(btn1)
+
+        btn4 = QPushButton('1')
+        btn4.clicked.connect(lambda: self.send_predefined_command('1'))
+        btn_layout.addWidget(btn4)
+
+        btn5 = QPushButton('10')
+        btn5.clicked.connect(lambda: self.send_predefined_command('10'))
+        btn_layout.addWidget(btn5)
         
         btn2 = QPushButton('20')
         btn2.clicked.connect(lambda: self.send_predefined_command('20'))
@@ -420,14 +437,28 @@ class PicoVisualizerApp(QMainWindow):
         )
     
     def update_plot(self):
+        global processed_since_last_update, last_update_time
+        
+        # Calculate sample rate
+        current_time = time.time()
+        time_elapsed = current_time - last_update_time
+        if time_elapsed > 0:
+            sample_rate = processed_since_last_update / time_elapsed
+        else:
+            sample_rate = 0
+        
+        # Reset counter and time for next interval
+        processed_since_last_update = 0
+        last_update_time = current_time
+        
         self.update_counter += 1
         with data_lock:
             if len(timestamps) > 1 and len(signals) > 1:
                 self.ax.clear()
                 self.ax.plot(timestamps, signals, 'b-', linewidth=1, label='Messwerte')
-                self.ax.set_xlabel('Zeit (ns)')
+                self.ax.set_xlabel('Zeit (us)')
                 self.ax.set_ylabel('Signal (mV)')
-                self.ax.set_title(f'Live Messdaten - {len(timestamps)} Punkte (Update #{self.update_counter})')
+                self.ax.set_title(f'Live Messdaten - {len(timestamps)} Punkte | {sample_rate:.1f} Mus/s (Update #{self.update_counter})')
                 self.ax.grid(True, alpha=0.3)
                 self.ax.legend()
                 
