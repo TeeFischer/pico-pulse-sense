@@ -299,6 +299,26 @@ class PicoVisualizerApp(QMainWindow):
         trig_hbox.addWidget(self.trig_release_btn)
 
         right_layout.addLayout(trig_hbox)
+        # Buffer size controls (adjustable + reset)
+        buf_hbox = QHBoxLayout()
+        buf_label = QLabel('BufferSize:')
+        buf_label.setFont(QFont('Arial', 9))
+        buf_hbox.addWidget(buf_label)
+
+        self.buf_input = QLineEdit()
+        self.buf_input.setText(str(BUFFER_SIZE))
+        self.buf_input.setFixedWidth(80)
+        buf_hbox.addWidget(self.buf_input)
+
+        buf_set_btn = QPushButton('Set BufferSize')
+        buf_set_btn.clicked.connect(self.set_buffer_size)
+        buf_hbox.addWidget(buf_set_btn)
+
+        buf_reset_btn = QPushButton('Reset Buffer')
+        buf_reset_btn.clicked.connect(self.reset_buffer)
+        buf_hbox.addWidget(buf_reset_btn)
+
+        right_layout.addLayout(buf_hbox)
         right_layout.addStretch()
         
         main_layout.addLayout(left_layout, 2)
@@ -362,6 +382,36 @@ class PicoVisualizerApp(QMainWindow):
             emitter.log_signal.emit("Trigger-Hold freigegeben. Buffer wird wieder normal geleert.")
         else:
             emitter.log_signal.emit("Trigger-Hold ist nicht aktiv.")
+
+    def set_buffer_size(self):
+        """Set BUFFER_SIZE from the UI input. Trim buffers if necessary."""
+        global BUFFER_SIZE, trigger_hold
+        txt = self.buf_input.text().strip()
+        try:
+            val = int(txt)
+            if val < 1:
+                raise ValueError("must be >=1")
+        except Exception:
+            emitter.log_signal.emit(f"Ungültige BufferSize: '{txt}'")
+            return
+
+        with data_lock:
+            old = BUFFER_SIZE
+            BUFFER_SIZE = val
+            # If not in trigger_hold, trim to new size
+            if (not trigger_hold) and len(timestamps) > BUFFER_SIZE:
+                excess = len(timestamps) - BUFFER_SIZE
+                del timestamps[0:excess]
+                del signals[0:excess]
+
+        emitter.log_signal.emit(f"BufferSize geändert: {old} -> {BUFFER_SIZE}")
+
+    def reset_buffer(self):
+        """Clear the current timestamp/signal buffers."""
+        with data_lock:
+            timestamps.clear()
+            signals.clear()
+        emitter.log_signal.emit("Buffer geleert.")
     
     def append_log(self, message):
         self.log_text.append(message)
