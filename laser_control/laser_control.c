@@ -16,8 +16,8 @@
 #define pwm_max 0.10f // Obere Grenze für PWM
 #define pwm_step 0.01f // Schrittweite für PWM-Anpassung
 
-#define lower_avg_threshold 300.0f // Untere Grenze für PWM-Regelung
-#define upper_avg_threshold 550.0f // Obere Grenze für PWM-Regelung
+#define lower_avg_threshold 450.0f // Untere Grenze für PWM-Regelung
+#define upper_avg_threshold 500.0f // Obere Grenze für PWM-Regelung
 
 #define PWM_GPIO 15     // Wähle einen freien GPIO, z.B. GPIO15
 #define PWM_WRAP 4095   // 12 Bit PWM-Auflösung
@@ -44,7 +44,7 @@ int main(void) {
     const float sys_clk = 125000000;
     float freq = 4000.0f;       // Gewünschte Frequenz
     
-    float pwm = 0.3f;                    // Start Duty Cycle (30%)
+    float pwm = 0.05f;                    // Start Duty Cycle (5%)
 
     // Clock divider (CLKDIV)
     // Wir wählen z.B. CLKDIV = 125, um Zählerfrequenz 1 MHz zu erhalten
