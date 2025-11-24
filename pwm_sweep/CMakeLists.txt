@@ -48,7 +48,8 @@ pico_enable_stdio_usb(pwm_sweep 1)
 target_link_libraries(pwm_sweep
         pico_stdlib
         hardware_adc
-        hardware_pwm)
+        hardware_pwm
+        hardware_flash)
 
 # Add the standard include files to the build
 target_include_directories(pwm_sweep PRIVATE
