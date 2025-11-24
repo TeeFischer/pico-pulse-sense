@@ -35,7 +35,7 @@ void adc_core1() {
             multicore_fifo_push_blocking(t);
             multicore_fifo_push_blocking(sample);
         }
-        sleep_us(500); 
+        sleep_us(250); 
     }
 }
 
