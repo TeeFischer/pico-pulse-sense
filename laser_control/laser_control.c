@@ -9,8 +9,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include "hardware/flash.h"
-#include "hardware/sync.h"
+#include <stddef.h>
 
 #define NUM_SAMPLES 20
 #define THRESHOLD 200 // Schwellwert für Flankenerkennung 4096 enspricht 3.3V
@@ -20,11 +19,11 @@
 #define START_DUTY_CYCLE 0.05f
 #define MAX_DUTY_CYCLE 100
 
-#define FLASH_TARGET_OFFSET (PICO_FLASH_SIZE_BYTES - 4096)
 
 #define pwm_min 0.01f // Untere Grenze für PWM
-#define pwm_max 0.10f // Obere Grenze für PWM
+#define pwm_max 0.50f // Obere Grenze für PWM
 #define pwm_step 0.01f // Schrittweite für PWM-Anpassung
+#define response_tolerance 25.0f // einstellbar (ADC units*VperDev)
 
 #define lower_avg_threshold 450.0f // Untere Grenze für PWM-Regelung
 #define upper_avg_threshold 500.0f // Obere Grenze für PWM-Regelung
@@ -38,27 +37,9 @@
 void init_safe_pwm_pin(void);
 void run_pwm_sweep(void);
 void pwm_sweep(float *result_array);
-void save_results_to_flash(float *values, size_t count);
-bool load_results_from_flash(float *buffer, size_t count);
 void laser_on(void);
 void laser_off(void);
 void set_pwm_from_float(float pwm);
-
-// Flash table format
-#define FLASH_TABLE_MAGIC 0x50574D54u // 'PWMT'
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint32_t count; // number of float entries
-    uint32_t reserved;
-    uint32_t checksum;
-} flash_table_header_t;
-
-static uint32_t compute_checksum(const uint8_t *data, size_t len) {
-    // simple 32-bit additive checksum
-    uint32_t sum = 0;
-    for (size_t i = 0; i < len; ++i) sum += data[i];
-    return sum;
-}
 
 // Globals to manage PWM state from multiple functions
 static uint pwm_slice = 0;
@@ -67,6 +48,10 @@ static uint16_t pwm_wrap_g = 0;
 static float pwm_clkdiv_g = 0.0f;
 static float current_pwm = START_DUTY_CYCLE;
 static bool pwm_enabled = false;
+
+// Reaction table (in RAM) used for measurements
+static float reaction_table[MAX_DUTY_CYCLE + 1];
+static bool reaction_table_ready = false;
 
 
 int main(void) {
@@ -96,8 +81,9 @@ int main(void) {
 
     uint16_t samples[NUM_SAMPLES];
 
-    static float flash_table[MAX_DUTY_CYCLE + 1];
-    bool has_flash_table = false;
+    // Reaction table (im RAM) wird zu Beginn erstellt
+    // (global: reaction_table)
+    reaction_table_ready = false;
 
     // serial command buffer
     char cmd_buf[64];
@@ -117,22 +103,11 @@ int main(void) {
         }
     }
 
-    // Versuche Tabelle aus Flash zu laden und zu validieren
-    if (load_results_from_flash(flash_table, MAX_DUTY_CYCLE + 1)) {
-        has_flash_table = true;
-        printf("Flash-Tabelle geladen.\n");
-    } else {
-        printf("Keine gültige Flash-Tabelle gefunden. Starte Sweep...\n");
-        run_pwm_sweep();
-        // Nach Sweep erneut laden
-        if (load_results_from_flash(flash_table, MAX_DUTY_CYCLE + 1)) {
-            has_flash_table = true;
-            printf("Tabelle nach Sweep geladen.\n");
-        } else {
-            printf("Warnung: Nach Sweep konnte die Tabelle nicht geladen werden. Verwende Fallback-Schwellen.\n");
-            has_flash_table = false;
-        }
-    }
+    // Erstelle die Reaktionstabelle zu Beginn im RAM
+    printf("Erstelle Reaktionstabelle (Sweep) im RAM...\n");
+    pwm_sweep(reaction_table);
+    reaction_table_ready = true;
+    printf("Reaktionstabelle erstellt.\n");
 
     while (1) {   // Dauerschleife
 
@@ -153,12 +128,12 @@ int main(void) {
         char print_message[100];  // Ein Puffer, um die Nachricht zu speichern
 
         // === Regelung: Wenn Tabelle vorhanden, vergleiche mit Erwartungswert ===
-        if (has_flash_table) {
+        if (reaction_table_ready) {
             // map current pwm (0..1) to index 0..MAX_DUTY_CYCLE
             int idx = (int)(pwm * (float)MAX_DUTY_CYCLE + 0.5f);
             if (idx < 0) idx = 0; if (idx > MAX_DUTY_CYCLE) idx = MAX_DUTY_CYCLE;
-            float expected = flash_table[idx];
-            const float response_tolerance = 25.0f; // einstellbar (ADC units*VperDev)
+            float expected = reaction_table[idx];
+            
 
             if (avg_an < expected - response_tolerance) {
                 pwm += pwm_step;
@@ -167,7 +142,7 @@ int main(void) {
                 pwm_set_gpio_level(PWM_GPIO, new_level);
                 snprintf(print_message, sizeof(print_message), "%.2f, PWM erhöht (gemessen %.2f < erwartet %.2f)\n", pwm, avg_an, expected);
                 // printf("%.2f, PWM erhöht (gemessen %.2f < erwartet %.2f)\n", pwm, avg_an, expected);
-            } else if (avg_an > expected + response_tolerance) {
+            } else if (avg_an > expected - response_tolerance) {
                 pwm -= pwm_step;
                 if (pwm < pwm_min) pwm = pwm_min;
                 uint16_t new_level = (uint16_t)(wrap * pwm);
@@ -176,30 +151,11 @@ int main(void) {
                 snprintf(print_message, sizeof(print_message), "%.2f, PWM verringert (gemessen %.2f > erwartet %.2f)\n", pwm, avg_an, expected);
                 //printf("%.2f, PWM verringert (gemessen %.2f > erwartet %.2f)\n", pwm, avg_an, expected);
             } else {
-                snprintf(print_message, sizeof(print_message), "%.2f, PWM bleibt (gemessen %.2f ≈ erwartet %.2f)\n", pwm, avg_an, expected);
+                        snprintf(print_message, sizeof(print_message), "%.2f, PWM bleibt (gemessen %.2f ≈ erwartet %.2f)\n", pwm, avg_an, expected);
                 //printf("%.2f, PWM bleibt (gemessen %.2f ≈ erwartet %.2f)\n", pwm, avg_an, expected);
             }
         } else {
-            // Fallback: altes Schwellenmodell
-            if (avg_an < lower_avg_threshold) {
-                pwm += pwm_step;
-                if (pwm > pwm_max) pwm = pwm_max;
-                uint16_t new_level = (uint16_t)(wrap * pwm);
-                pwm_set_gpio_level(PWM_GPIO, new_level);
-                //printf("%.2f, PWM erhöht\n", pwm);
-                snprintf(print_message, sizeof(print_message), "%.2f, PWM erhöht\n", pwm);
-            }
-            else if (avg_an > upper_avg_threshold) {
-                pwm -= pwm_step;
-                if (pwm < pwm_min) pwm = pwm_min;
-                uint16_t new_level = (uint16_t)(wrap * pwm);
-                pwm_set_gpio_level(PWM_GPIO, new_level);
-                //printf("%.2f, PWM verringert\n", pwm);
-                snprintf(print_message, sizeof(print_message), "%.2f, PWM verringert\n", pwm);
-            } else {
-                //printf("%.2f, PWM bleibt\n", pwm);
-                snprintf(print_message, sizeof(print_message), "%.2f, PWM bleibt\n", pwm);
-            }
+            printf("Keine Reaktionstabelle vorhanden! Command 'sweep'\n");
         }
 
         // Ausgabe der Ergebnisse
@@ -219,17 +175,11 @@ int main(void) {
                     } else if (strcmp(cmd_buf, "aus") == 0) {
                         laser_off();
                         printf("OK: Laser_aus\n");
-                    } else if (strcmp(cmd_buf, "sweep") == 0 || strcmp(cmd_buf, "sweep") == 0) {
-                        printf("Starte manuellen Sweep...\n");
-                        run_pwm_sweep();
-                        // reload table
-                        if (load_results_from_flash(flash_table, MAX_DUTY_CYCLE + 1)) {
-                            has_flash_table = true;
-                            printf("Tabelle nach manuellem Sweep geladen.\n");
-                        } else {
-                            has_flash_table = false;
-                            printf("Fehler: Tabelle nach Sweep nicht geladen.\n");
-                        }
+                    } else if (strcmp(cmd_buf, "sweep") == 0) {
+                        printf("Starte manuellen Sweep und aktualisiere Reaktionstabelle im RAM...\n");
+                        pwm_sweep(reaction_table);
+                        reaction_table_ready = true;
+                        printf("Tabelle nach manuellem Sweep aktualisiert.\n");
                     } else {
                         printf("Unbekannter Befehl: %s\n", cmd_buf);
                     }
@@ -301,10 +251,13 @@ void run_pwm_sweep(){
 
     pwm_sweep(sweep_results);
 
-    printf("Speichere Daten...\n");
-    save_results_to_flash(sweep_results, MAX_DUTY_CYCLE + 1);
+    // Kopiere Ergebnisse in die globale In-RAM-Reaktionstabelle
+    for (int i = 0; i <= MAX_DUTY_CYCLE; i++) {
+        reaction_table[i] = sweep_results[i];
+    }
+    reaction_table_ready = true;
 
-    printf("Sweep beendet! Werte gespeichert.\n");
+    printf("Sweep beendet! Reaktionstabelle im RAM aktualisiert.\n");
 
     for (int i = 0; i <= MAX_DUTY_CYCLE; i++)
         printf("%d, %.3f\n", i, sweep_results[i]);
@@ -351,61 +304,3 @@ void pwm_sweep(float *result_array) {
     gpio_put(PWM_GPIO, 0);  // DEAD-SAFE
 }
 
-// -------------------------
-// FLASH-Speicher-Funktionen
-// -------------------------
-void save_results_to_flash(float *values, size_t count) {
-
-    uint32_t ints = save_and_disable_interrupts();
-
-    // prepare header
-    flash_table_header_t header;
-    header.magic = FLASH_TABLE_MAGIC;
-    header.count = (uint32_t)count;
-    header.reserved = 0;
-    // checksum over float data
-    uint32_t checksum = compute_checksum((const uint8_t*)values, count * sizeof(float));
-    header.checksum = checksum;
-
-    flash_range_erase(FLASH_TARGET_OFFSET, 4096);
-
-    // write header
-    flash_range_program(FLASH_TARGET_OFFSET, (const uint8_t*)&header, sizeof(header));
-
-    // write payload (floats) immediately after header
-    flash_range_program(FLASH_TARGET_OFFSET + sizeof(header), (const uint8_t*)values, count * sizeof(float));
-
-    restore_interrupts(ints);
-}
-
-bool load_results_from_flash(float *buffer, size_t count) {
-    const uint8_t *flash_ptr = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
-
-    // Try new header format first
-    if (sizeof(flash_table_header_t) <= 4096) {
-        const flash_table_header_t *h = (const flash_table_header_t *)flash_ptr;
-        if (h->magic == FLASH_TABLE_MAGIC && h->count == (uint32_t)count) {
-            const uint8_t *data_ptr = flash_ptr + sizeof(flash_table_header_t);
-            uint32_t cs = compute_checksum(data_ptr, count * sizeof(float));
-            if (cs == h->checksum) {
-                memcpy(buffer, data_ptr, count * sizeof(float));
-                return true;
-            }
-        }
-    }
-
-    // Legacy fallback: try to interpret start of flash region as raw float array
-    // Validate values are in plausible range (>=0 and < 5000)
-    const float *maybe_floats = (const float *)flash_ptr;
-    bool ok = true;
-    for (size_t i = 0; i < count; ++i) {
-        float v = maybe_floats[i];
-        if (!(v >= 0.0f && v < 5000.0f)) { ok = false; break; }
-    }
-    if (ok) {
-        memcpy(buffer, maybe_floats, count * sizeof(float));
-        return true;
-    }
-
-    return false;
-}
