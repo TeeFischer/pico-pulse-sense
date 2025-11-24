@@ -9,22 +9,12 @@
 #define PULSE_PIN 15
 #define SAMPLES_PER_STEP 1500    // Anzahl Messungen pro Duty-Cycle
 #define VperDev 0.806f           // Umrechnung ADC->Volt (abhängig vom ADC-Setup)
+#define MAX_DUTY_CYCLE 255      // Maximaler Duty-Cycle in Prozent
 
 int main() {
     stdio_init_all();
 
-    // --- Startsignal ---
-    printf("Bereit. Drücke Enter, um den PWM-Sweep zu starten...\n");
-    while (true) {
-        int c = getchar_timeout_us(0);
-        if (c == '\r' || c == '\n') {
-            break;
-        }
-    }
-    printf("Starte Sweep...\n");
-
     // --- PWM Setup ---
-    gpio_set_function(PULSE_PIN, GPIO_FUNC_PWM);
     uint slice_num = pwm_gpio_to_slice_num(PULSE_PIN);
     uint channel = pwm_gpio_to_channel(PULSE_PIN);
 
@@ -35,49 +25,67 @@ int main() {
 
     pwm_set_wrap(slice_num, wrap);
     pwm_set_clkdiv(slice_num, clkdiv);
-    pwm_set_enabled(slice_num, true);
+
+    // PWM zu Beginn ausschalten
+    pwm_set_enabled(slice_num, false);
+    gpio_set_function(PULSE_PIN, GPIO_FUNC_SIO);
+    gpio_set_dir(PULSE_PIN, GPIO_OUT);
+    gpio_put(PULSE_PIN, 0);
+    
 
     // --- ADC Setup ---
     adc_init();
     adc_gpio_init(26);
     adc_select_input(0);
 
-    // --- Tabellenkopf ---
-    printf("PWM_Duty(%%), Mittelwert(V)\n");
+    while(true){
+        // --- Startsignal ---
+        printf("Bereit. Drücke Enter, um den PWM-Sweep zu starten...\n");
+        while (true) {
+            int c = getchar_timeout_us(0);
+            if (c == '\r' || c == '\n') {
+                break;
+            }
+        }
+        printf("Starte Sweep...\n");
+        
+        // --- Pin als PWM rekonfigurieren ---
+        gpio_set_function(PULSE_PIN, GPIO_FUNC_PWM);
+        pwm_set_enabled(slice_num, true);
 
-    // --- PWM Sweep ---
-    for (int duty = 0; duty <= 100; duty++) {
+        // --- Tabellenkopf ---
+        printf("PWM_Duty(%%), Mittelwert(V)\n");
 
-        uint16_t level = (wrap * duty) / 100;
-        pwm_set_chan_level(slice_num, channel, level);
+        // --- PWM Sweep ---
+        for (int duty = 0; duty <= MAX_DUTY_CYCLE; duty++) {
 
-        // kurze Stabilisationszeit
-        sleep_ms(20);
+            uint16_t level = (wrap * duty) / MAX_DUTY_CYCLE;
+            pwm_set_chan_level(slice_num, channel, level);
 
-        // --- Mittelwertbildung ---
-        uint64_t sum = 0;
+            // kurze Stabilisationszeit
+            sleep_ms(20);
 
-        for (int i = 0; i < SAMPLES_PER_STEP; i++) {
-            uint16_t sample = adc_read();
-            sum += sample;
+            // --- Mittelwertbildung ---
+            uint64_t sum = 0;
+
+            for (int i = 0; i < SAMPLES_PER_STEP; i++) {
+                uint16_t sample = adc_read();
+                sum += sample;
+            }
+
+            float avg_adc = (float)sum / SAMPLES_PER_STEP;
+            float avg_voltage = avg_adc * VperDev;
+
+            // --- Tabellenzeile ausgeben ---
+            printf("%d, %.3f\n", duty, avg_voltage);
         }
 
-        float avg_adc = (float)sum / SAMPLES_PER_STEP;
-        float avg_voltage = avg_adc * VperDev;
+        // PWM ausschalten
+        pwm_set_enabled(slice_num, false);
+        gpio_set_function(PULSE_PIN, GPIO_FUNC_SIO);
+        gpio_set_dir(PULSE_PIN, GPIO_OUT);
+        gpio_put(PULSE_PIN, 0);
 
-        // --- Tabellenzeile ausgeben ---
-        printf("%d, %.3f\n", duty, avg_voltage);
-    }
-
-    // PWM ausschalten
-    pwm_set_enabled(slice_num, false);
-    gpio_set_function(PULSE_PIN, GPIO_FUNC_SIO);
-    gpio_set_dir(PULSE_PIN, GPIO_OUT);
-    gpio_put(PULSE_PIN, 0);
-
-    printf("\nSweep beendet!\n");
-
-    while (true) {
-        tight_loop_contents();
+        printf("\nSweep beendet!\n");
     }
 }
