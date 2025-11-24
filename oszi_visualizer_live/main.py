@@ -17,6 +17,7 @@ PRE_TRIGGER = 100  # number of samples to include before the trigger
 
 timestamps = []
 signals = []
+pwm = []
 running = True
 data_lock = threading.Lock()
 ser = None
@@ -33,8 +34,8 @@ trigger_hold = False  # when True, buffer is not popped/cleared
 class SignalEmitter(QObject):
     log_signal = pyqtSignal(str)
     plot_signal = pyqtSignal()
-    # Emitted when trigger snapshot is ready: (timestamps_list, signals_list)
-    trigger_snapshot = pyqtSignal(object, object)
+    # Emitted when trigger snapshot is ready: (timestamps_list, signals_list, pwm_list)
+    trigger_snapshot = pyqtSignal(object, object, object)
 
 emitter = SignalEmitter()
 
@@ -58,9 +59,9 @@ def open_serial_port(com_port, baud_rate):
     except serial.SerialException as e:
         print(f"Fehler beim Öffnen des Ports {com_port}: {e}")
         return None
-# ...existing code...
+
 def read_serial_data(ser):
-    global timestamps, signals, running, trigger_enabled, trigger_threshold, trigger_hold, processed_since_last_update
+    global timestamps, signals, pwm, running, trigger_enabled, trigger_threshold, trigger_hold, processed_since_last_update
     emitter.log_signal.emit("Serial-Lese-Thread gestartet...")
     byte_buf = b''
     processed = 0
@@ -89,66 +90,78 @@ def read_serial_data(ser):
                     if not line:
                         continue
 
-                    try:
-                        # Erwartetes Format: "time_ns,signal_mv"
-                        time_ns_str, signal_mv_str = map(str.strip, line.split(',', 1))
-                        time_ns = float(time_ns_str)
-                        signal_mv = float(signal_mv_str)
+                    # Erwartetes Format: "time_ns, signal_mv, pwm"
+                    # Entferne Leerzeichen und prüfe, ob die Zeile die richtige Anzahl an Teilen hat
+                    parts = line.strip().split(',')
+                    if len(parts) != 3:
+                        emitter.log_signal.emit(f"⚠ Unparsable Zeile (nicht 3 Teile): '{line}'")
+                    else:
+                        time_ns_str, signal_mv_str, pwm_str = map(str.strip, parts)
+                        try:
+                            time_ns = float(time_ns_str)
+                            signal_mv = float(signal_mv_str)
+                            pwm_val = float(pwm_str)
 
-                        with data_lock:
-                            timestamps.append(time_ns)
-                            signals.append(signal_mv)
-                            # Trigger detection: if enabled and not yet in hold
-                            try:
-                                if trigger_enabled and (not trigger_hold) and (signal_mv > float(trigger_threshold)):
-                                    trigger_hold = True
-                                    # Capture up to PRE_TRIGGER samples before the trigger plus the triggering sample
-                                    pre_available = max(0, len(timestamps) - 1)  # exclude current sample at end
-                                    pre_count = PRE_TRIGGER if pre_available >= PRE_TRIGGER else pre_available
-                                    start_idx = max(0, len(timestamps) - 1 - pre_count)
-                                    # slice from start_idx to end to include pre samples and current sample
-                                    snapshot_ts = timestamps[start_idx:]
-                                    snapshot_sig = signals[start_idx:]
-                                    # Set target length: pre_count + 1 (trigger) + BUFFER_SIZE (following samples)
-                                    snapshot_target_len = len(snapshot_sig) + BUFFER_SIZE
-                                    collecting_snapshot = True
-                                    emitter.log_signal.emit(f"▶ Trigger ausgelöst bei {signal_mv} (Schwelle {trigger_threshold}) - Snapshot startet mit {len(snapshot_sig)} Pre-Samples; Ziel: {snapshot_target_len} samples")
-                            except Exception:
-                                # ignore invalid threshold or other errors
-                                pass
-
-                            # If currently collecting snapshot, append new incoming samples until target length reached
-                            if collecting_snapshot:
-                                # snapshot lists already contain current and pre samples; further incoming samples are appended here
-                                if len(snapshot_sig) < snapshot_target_len:
-                                    snapshot_ts.append(time_ns)
-                                    snapshot_sig.append(signal_mv)
-
-                            # If we've collected enough samples, emit snapshot and stop collecting
-                            if collecting_snapshot and snapshot_target_len is not None and len(snapshot_sig) >= snapshot_target_len:
+                            with data_lock:
+                                timestamps.append(time_ns)
+                                signals.append(signal_mv)
+                                pwm.append(pwm_val)
+                                # Trigger detection: if enabled and not yet in hold
                                 try:
-                                    emitter.trigger_snapshot.emit(list(snapshot_ts), list(snapshot_sig))
-                                    emitter.log_signal.emit(f"▶ Snapshot ready ({len(snapshot_sig)} samples) - Fenster wird geöffnet")
-                                except Exception as e:
-                                    emitter.log_signal.emit(f"Fehler beim Senden des Snapshots: {e}")
-                                collecting_snapshot = False
-                                snapshot_target_len = None
+                                    if trigger_enabled and (not trigger_hold) and (signal_mv > float(trigger_threshold)):
+                                        trigger_hold = True
+                                        # Capture up to PRE_TRIGGER samples before the trigger plus the triggering sample
+                                        pre_available = max(0, len(timestamps) - 1)  # exclude current sample at end
+                                        pre_count = PRE_TRIGGER if pre_available >= PRE_TRIGGER else pre_available
+                                        start_idx = max(0, len(timestamps) - 1 - pre_count)
+                                        # slice from start_idx to end to include pre samples and current sample
+                                        snapshot_ts = timestamps[start_idx:]
+                                        snapshot_sig = signals[start_idx:]
+                                        snapshot_pwm = pwm[start_idx:]
+                                        # Set target length: pre_count + 1 (trigger) + BUFFER_SIZE (following samples)
+                                        snapshot_target_len = len(snapshot_sig) + BUFFER_SIZE
+                                        collecting_snapshot = True
+                                        emitter.log_signal.emit(f"▶ Trigger ausgelöst bei {signal_mv} (Schwelle {trigger_threshold}) - Snapshot startet mit {len(snapshot_sig)} Pre-Samples; Ziel: {snapshot_target_len} samples")
+                                except Exception:
+                                    # ignore invalid threshold or other errors
+                                    pass
 
-                            # Only pop oldest if not in trigger hold
-                            if (not trigger_hold) and len(timestamps) > BUFFER_SIZE:
-                                timestamps.pop(0)
-                                signals.pop(0)
+                                # If currently collecting snapshot, append new incoming samples until target length reached
+                                if collecting_snapshot:
+                                    # snapshot lists already contain current and pre samples; further incoming samples are appended here
+                                    if len(snapshot_sig) < snapshot_target_len:
+                                        snapshot_ts.append(time_ns)
+                                        snapshot_sig.append(signal_mv)
+                                        snapshot_pwm.append(pwm_val)
 
-                        processed += 1
-                        processed_since_last_update += 1
-                        # if processed % 50 == 0:
-                        #     emitter.log_signal.emit(f"✓ Daten verarbeitet: {processed} (puffer: {len(timestamps)})")
+                                # If we've collected enough samples, emit snapshot and stop collecting
+                                if collecting_snapshot and snapshot_target_len is not None and len(snapshot_sig) >= snapshot_target_len:
+                                    try:
+                                        emitter.trigger_snapshot.emit(list(snapshot_ts), list(snapshot_sig), list(snapshot_pwm))
+                                        emitter.log_signal.emit(f"▶ Snapshot ready ({len(snapshot_sig)} samples) - Fenster wird geöffnet")
+                                    except Exception as e:
+                                        emitter.log_signal.emit(f"Fehler beim Senden des Snapshots: {e}")
+                                    collecting_snapshot = False
+                                    snapshot_target_len = None
 
-                    except ValueError:
-                        # Logge die rohe Zeile zur Analyse, versuche keine weitere Zerlegung hier
-                        emitter.log_signal.emit(f"⚠ Unparsable Zeile: '{line}'")
-                    except Exception as e:
-                        emitter.log_signal.emit(f"Fehler beim Verarbeiten: '{line}' ({e})")
+                                # Only pop oldest if not in trigger hold
+                                if (not trigger_hold) and len(timestamps) > BUFFER_SIZE:
+                                    timestamps.pop(0)
+                                    signals.pop(0)
+                                    # keep pwm buffer in sync
+                                    if len(pwm) > 0:
+                                        pwm.pop(0)
+
+                            processed += 1
+                            processed_since_last_update += 1
+                            # if processed % 50 == 0:
+                            #     emitter.log_signal.emit(f"✓ Daten verarbeitet: {processed} (puffer: {len(timestamps)})")
+
+                        except ValueError:
+                            # Logge die rohe Zeile zur Analyse, versuche keine weitere Zerlegung hier
+                            emitter.log_signal.emit(f"⚠ Unparsable Zeile: '{line}'")
+                        except Exception as e:
+                            emitter.log_signal.emit(f"Fehler beim Verarbeiten: '{line}' ({e})")
         except Exception as e:
             emitter.log_signal.emit(f"Fehler beim Lesen: {e}")
             break
@@ -168,18 +181,23 @@ def send_command_to_pico(command):
 
 
 class SnapshotWindow(QMainWindow):
-    """Window to display a snapshot (triggering sample + next BUFFER_SIZE samples)."""
-    def __init__(self, ts_list, sig_list):
+    """Window to display a snapshot (triggering sample + next BUFFER_SIZE samples).
+    Now supports plotting both signal (mV) and PWM (secondary subplot).
+    """
+    def __init__(self, ts_list, sig_list, pwm_list=None):
         super().__init__()
         self.setWindowTitle('Trigger Snapshot')
-        self.setGeometry(200, 200, 1000, 600)
+        self.setGeometry(200, 200, 1000, 700)
 
         central = QWidget()
         layout = QVBoxLayout()
 
-        self.figure = Figure(figsize=(8, 5), dpi=100)
+        self.figure = Figure(figsize=(9, 6), dpi=100)
         self.canvas = FigureCanvas(self.figure)
-        self.ax = self.figure.add_subplot(111)
+
+        # Create two stacked subplots (signal on top, pwm below) sharing x-axis
+        self.ax = self.figure.add_subplot(211)
+        self.ax2 = self.figure.add_subplot(212, sharex=self.ax)
 
         # Navigation toolbar for zoom/pan
         try:
@@ -196,7 +214,8 @@ class SnapshotWindow(QMainWindow):
 
         # Plot provided data
         try:
-            self.ax.plot(ts_list, sig_list, 'b-', linewidth=1)
+            # Top: signal
+            self.ax.plot(ts_list, sig_list, 'b-', linewidth=1, label='Signal')
             self.ax.set_title(f'Trigger Snapshot - {len(sig_list)} samples')
             self.ax.set_xlabel('Zeit (ns)')
             self.ax.set_ylabel('Signal (mV)')
@@ -205,6 +224,21 @@ class SnapshotWindow(QMainWindow):
                 self.ax.set_xlim([min(ts_list), max(ts_list)])
             if len(sig_list) > 0:
                 self.ax.set_ylim([min(sig_list) - 10, max(sig_list) + 10])
+
+            # Bottom: PWM (if provided)
+            if pwm_list is not None and len(pwm_list) > 0:
+                # Align lengths defensively
+                min_len = min(len(ts_list), len(pwm_list))
+                ts_plot = ts_list[-min_len:]
+                pwm_plot = pwm_list[-min_len:]
+                self.ax2.plot(ts_plot, pwm_plot, color='orange', linewidth=1, label='PWM')
+                self.ax2.set_xlabel('Zeit (ns)')
+                self.ax2.set_ylabel('PWM')
+                self.ax2.grid(True, alpha=0.3)
+            else:
+                # if no pwm data, display a small note
+                self.ax2.text(0.5, 0.5, 'Keine PWM-Daten im Snapshot', ha='center', va='center', transform=self.ax2.transAxes)
+
             self.canvas.draw()
         except Exception as e:
             emitter.log_signal.emit(f"Fehler beim Zeichnen des Snapshots: {e}")
@@ -292,6 +326,14 @@ class PicoVisualizerApp(QMainWindow):
         btn3 = QPushButton('60')
         btn3.clicked.connect(lambda: self.send_predefined_command('60'))
         btn_layout.addWidget(btn3)
+
+        btn6 = QPushButton('an')
+        btn6.clicked.connect(lambda: self.send_predefined_command('an'))
+        btn_layout.addWidget(btn6)
+
+        btn7 = QPushButton('aus')
+        btn7.clicked.connect(lambda: self.send_predefined_command('aus'))
+        btn_layout.addWidget(btn7)
         
         right_layout.addLayout(btn_layout)
 
@@ -347,10 +389,10 @@ class PicoVisualizerApp(QMainWindow):
         emitter.plot_signal.connect(self.update_plot)
         emitter.trigger_snapshot.connect(self.open_snapshot_window)
 
-    def open_snapshot_window(self, ts_list, sig_list):
-        """Open a new window displaying the given timestamp/signal snapshot."""
+    def open_snapshot_window(self, ts_list, sig_list, pwm_list=None):
+        """Open a new window displaying the given timestamp/signal/pwm snapshot."""
         try:
-            win = SnapshotWindow(ts_list, sig_list)
+            win = SnapshotWindow(ts_list, sig_list, pwm_list)
             self.snapshot_windows.append(win)
             win.show()
             emitter.log_signal.emit("Snapshot-Fenster geöffnet.")
@@ -420,6 +462,11 @@ class PicoVisualizerApp(QMainWindow):
                 excess = len(timestamps) - BUFFER_SIZE
                 del timestamps[0:excess]
                 del signals[0:excess]
+                # keep pwm buffer in sync
+                if len(pwm) > excess:
+                    del pwm[0:excess]
+                else:
+                    pwm.clear()
 
         emitter.log_signal.emit(f"BufferSize geändert: {old} -> {BUFFER_SIZE}")
 
@@ -428,6 +475,7 @@ class PicoVisualizerApp(QMainWindow):
         with data_lock:
             timestamps.clear()
             signals.clear()
+            pwm.clear()
         emitter.log_signal.emit("Buffer geleert.")
     
     def append_log(self, message):
@@ -454,19 +502,50 @@ class PicoVisualizerApp(QMainWindow):
         self.update_counter += 1
         with data_lock:
             if len(timestamps) > 1 and len(signals) > 1:
-                self.ax.clear()
-                self.ax.plot(timestamps, signals, 'b-', linewidth=1, label='Messwerte')
-                self.ax.set_xlabel('Zeit (us)')
-                self.ax.set_ylabel('Signal (mV)')
-                self.ax.set_title(f'Live Messdaten - {len(timestamps)} Punkte | {sample_rate:.1f} Mus/s (Update #{self.update_counter})')
-                self.ax.grid(True, alpha=0.3)
-                self.ax.legend()
-                
-                if len(timestamps) > 0:
-                    self.ax.set_xlim([min(timestamps), max(timestamps)])
-                if len(signals) > 0:
-                    self.ax.set_ylim([min(signals) - 10, max(signals) + 10])
-                
+                # draw fresh figure each update to avoid stale axes/labels
+                self.figure.clear()
+                ax = self.figure.add_subplot(111)
+
+                # Align lengths defensively
+                min_len = min(len(timestamps), len(signals), len(pwm)) if len(pwm) > 0 else min(len(timestamps), len(signals))
+                ts_plot = timestamps[-min_len:]
+                sig_plot = signals[-min_len:]
+
+                # Primary axis: signal
+                line1, = ax.plot(ts_plot, sig_plot, 'b-', linewidth=1, label='Signal (mV)')
+                ax.set_xlabel('Zeit (ns)')
+                ax.set_ylabel('Signal (mV)')
+                ax.set_title(f'Live Messdaten - {len(timestamps)} Punkte | {sample_rate:.1f} Mus/s (Update #{self.update_counter})')
+                ax.grid(True, alpha=0.3)
+
+                # Enforce fixed y-axis for the measured signal
+                try:
+                    ax.set_ylim([0, 800])
+                except Exception:
+                    # fallback to autoscale if something goes wrong
+                    pass
+
+                # Secondary axis: PWM (if present)
+                if len(pwm) > 0:
+                    pwm_plot = pwm[-min_len:]
+                    ax2 = ax.twinx()
+                    line2, = ax2.plot(ts_plot, pwm_plot, color='orange', linewidth=1, label='PWM')
+                    ax2.set_ylabel('PWM')
+                    # Enforce fixed PWM axis between 0 and 1
+                    try:
+                        ax2.set_ylim([0, 1])
+                    except Exception:
+                        pass
+                    # combine legends
+                    lines = [line1, line2]
+                    labels = [l.get_label() for l in lines]
+                    ax.legend(lines, labels, loc='upper right')
+                else:
+                    ax.legend(loc='upper right')
+
+                if len(ts_plot) > 0:
+                    ax.set_xlim([min(ts_plot), max(ts_plot)])
+
                 self.canvas.draw()
             else:
                 # Warten auf Daten
