@@ -7,8 +7,7 @@
 #include "pico/time.h"
 
 #define PULSE_PIN 15
-#define PULSE_DURATION_MS 100   // Fixe Pulsdauer
-#define PWM_FREQ_HZ 1000        // PWM-Frequenz (1 kHz)
+#define PULSE_DURATION_MS 1000   // Fixe Pulsdauer
 #define NUM_SAMPLES 1000
 #define VperDev 0.806
 
@@ -29,7 +28,7 @@ int main() {
     // PWM-Frequenz einstellen
     // Systemtakt normalerweise 125 MHz
     const float sys_clk = 125000000;
-    float freq = 4000.0f;                 // Gewünschte Puls-Frequenz
+    float freq = 0.00001f;                 // Gewünschte Puls-Frequenz
     // Clock divider: z.B. CLKDIV = 125, um Zählerfrequenz 1 MHz zu erhalten
     float clkdiv = 125.0f;
 
