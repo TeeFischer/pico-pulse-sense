@@ -6,11 +6,21 @@
 #include "hardware/adc.h"
 #include "hardware/pwm.h" // PWM-Header hinzufügen
 #include "pico/time.h" // Zeitfunktionen hinzufügen
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include "hardware/flash.h"
+#include <math.h>
 
-#define NUM_SAMPLES 300
+#define NUM_SAMPLES 20
 #define THRESHOLD 200 // Schwellwert für Flankenerkennung 4096 enspricht 3.3V
 // 600mV entsprechen 744 ADC-Wert bei 12 Bit Auflösung
-#define VperDev 0.806
+#define SAMPLES_PER_STEP 1500
+#define VperDev 0.806f
+#define START_DUTY_CYCLE 0.05f
+#define MAX_DUTY_CYCLE 100
+
+#define FLASH_TARGET_OFFSET (PICO_FLASH_SIZE_BYTES - 4096)
 
 #define pwm_min 0.01f // Untere Grenze für PWM
 #define pwm_max 0.10f // Obere Grenze für PWM
@@ -24,167 +34,263 @@
 //#define PWM_LEVEL 480  // Duty Cycle (30/255)
 #define PWM_LEVEL 1606  // Duty Cycle (100/255)
 
-// Funktionsprototyp einfügen
-void startmessung(void);
+// Funktionsprototypen einfügen
+void init_safe_pwm_pin(void);
+void run_pwm_sweep(void);
+void pwm_sweep(float *result_array);
+void save_results_to_flash(float *values, size_t count);
+bool load_results_from_flash(float *buffer, size_t count);
+
+// Flash table format
+#define FLASH_TABLE_MAGIC 0x50574D54u // 'PWMT'
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t count; // number of float entries
+    uint32_t reserved;
+    uint32_t checksum;
+} flash_table_header_t;
+
+static uint32_t compute_checksum(const uint8_t *data, size_t len) {
+    // simple 32-bit additive checksum
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len; ++i) sum += data[i];
+    return sum;
+}
 
 
 int main(void) {
     stdio_init_all();
+
+    // PIN ZUERST ABSICHERN!
+    init_safe_pwm_pin();
+
+    // ADC Setup
     adc_init();
-    adc_gpio_init(26); // GPIO26 = ADC0
-    gpio_set_pulls(26,0,1);  // input Pulldown
+    adc_gpio_init(26);
     adc_select_input(0);
 
-    // PWM initialisieren
-    gpio_set_function(PWM_GPIO, GPIO_FUNC_PWM);
-    uint slice_num = pwm_gpio_to_slice_num(PWM_GPIO);
-
-    // PWM konfigurieren neu
-    // Systemtakt normalerweise 125 MHz
     const float sys_clk = 125000000;
-    float freq = 4000.0f;       // Gewünschte Frequenz
-    
-    float pwm = 0.05f;                    // Start Duty Cycle (5%)
-
-    // Clock divider (CLKDIV)
-    // Wir wählen z.B. CLKDIV = 125, um Zählerfrequenz 1 MHz zu erhalten
+    float freq = 1000.0f;
     float clkdiv = 125.0f;
-
-    // Wrap Wert berechnen: Wrap = (PWM_Takt / freq) - 1
     uint16_t wrap = (uint16_t)((sys_clk / clkdiv) / freq) - 1;
-
-    pwm_set_clkdiv(slice_num, clkdiv);
-    pwm_set_wrap(slice_num, wrap);
-
-    // Duty Cycle einstellen (50%)
-    pwm_set_gpio_level(PWM_GPIO, (uint16_t)(wrap * pwm));
-    pwm_set_enabled(slice_num, false);
+    
+    float pwm = START_DUTY_CYCLE;
 
     sleep_ms(1000); // Warten bis USB-Serial bereit
 
     uint16_t samples[NUM_SAMPLES];
-#if timestamping
-    uint32_t timestamps[NUM_SAMPLES];
-#endif
 
-    pwm_set_enabled(slice_num, true);
+    static float flash_table[MAX_DUTY_CYCLE + 1];
+    bool has_flash_table = false;
+
+    // Versuche Tabelle aus Flash zu laden und zu validieren
+    if (load_results_from_flash(flash_table, MAX_DUTY_CYCLE + 1)) {
+        has_flash_table = true;
+        printf("Flash-Tabelle geladen.\n");
+    } else {
+        printf("Keine gültige Flash-Tabelle gefunden. Starte Sweep...\n");
+        run_pwm_sweep();
+        // Nach Sweep erneut laden
+        if (load_results_from_flash(flash_table, MAX_DUTY_CYCLE + 1)) {
+            has_flash_table = true;
+            printf("Tabelle nach Sweep geladen.\n");
+        } else {
+            printf("Warnung: Nach Sweep konnte die Tabelle nicht geladen werden. Verwende Fallback-Schwellen.\n");
+            has_flash_table = false;
+        }
+    }
+
     while (1) {   // Dauerschleife
-        //pwm_set_enabled(slice_num, false);
-        //sleep_ms(100); // Warten bis Laser sicher aus ist
-
-        //startmessung();
-        //pwm_set_enabled(slice_num, true);
 
         // Messungenen durchführen
         for (int i = 0; i < NUM_SAMPLES; i++) {
-#if timestamping
-            timestamps[i] = time_us_32();
-#endif
             samples[i] = adc_read();
         }
 
-        // PWM-Analyse: Puls suchen
-        int pulse_start = -1, pulse_end = -1;
-        uint16_t min_val = 4095, max_val = 0;
-
-        // Suche steigende Flanke
-        for (int i = 1; i < NUM_SAMPLES; i++) {
-            if (samples[i-1] < THRESHOLD && samples[i] >= THRESHOLD) {
-                pulse_start = i;
-                break;
-            }
-        }
-        // Suche fallende Flanke nach steigender
-        if (pulse_start != -1) {
-            for (int i = pulse_start + 1; i < NUM_SAMPLES; i++) {
-                if (samples[i-1] >= THRESHOLD && samples[i] < THRESHOLD) {
-                    pulse_end = i;
-                    break;
-                }
-            }
-        }
-
+        // Berechnung der durchschnittlichen Amplitude
         float avg_an = 0.0f;
+        float sum_an = 0.0f;
+        for (int i = 0; i < NUM_SAMPLES; i++) {
+            sum_an += samples[i];
+        }
+        avg_an = (float)sum_an / NUM_SAMPLES * VperDev;
 
-        // Wenn Puls erkannt, Durchschnittswerte berechnen
-        if (pulse_start != -1 && pulse_end != -1) {
-        #if timestamping
-            uint32_t pulse_time_us = timestamps[pulse_end] - timestamps[pulse_start];
-        #endif
+        // === Regelung: Wenn Tabelle vorhanden, vergleiche mit Erwartungswert ===
+        if (has_flash_table) {
+            // map current pwm (0..1) to index 0..MAX_DUTY_CYCLE
+            int idx = (int)roundf(pwm * (float)MAX_DUTY_CYCLE);
+            if (idx < 0) idx = 0; if (idx > MAX_DUTY_CYCLE) idx = MAX_DUTY_CYCLE;
+            float expected = flash_table[idx];
+            const float response_tolerance = 25.0f; // einstellbar (ADC units*VperDev)
 
-            // Berechnung der durchschnittlichen Amplitude
-            uint32_t sum_an = 0;
-            int count_an = pulse_end - pulse_start;
-            for (int i = pulse_start; i < pulse_end; i++) {
-                sum_an += samples[i];
+            if (avg_an < expected - response_tolerance) {
+                pwm += pwm_step;
+                if (pwm > pwm_max) pwm = pwm_max;
+                uint16_t new_level = (uint16_t)(wrap * pwm);
+                pwm_set_gpio_level(PWM_GPIO, new_level);
+                printf("%.2f, PWM erhöht (gemessen %.2f < erwartet %.2f)\n", pwm, avg_an, expected);
+            } else if (avg_an > expected + response_tolerance) {
+                pwm -= pwm_step;
+                if (pwm < pwm_min) pwm = pwm_min;
+                uint16_t new_level = (uint16_t)(wrap * pwm);
+                pwm_set_gpio_level(PWM_GPIO, new_level);
+                printf("%.2f, PWM verringert (gemessen %.2f > erwartet %.2f)\n", pwm, avg_an, expected);
+            } else {
+                printf("%.2f, PWM bleibt (gemessen %.2f ≈ erwartet %.2f)\n", pwm, avg_an, expected);
             }
-            avg_an = count_an > 0 ? (float)sum_an / count_an * VperDev : 0.0f;
-
-            // Berechnung der durchschnittlichen Amplitude nach Pulsende
-            uint32_t sum_aus = 0;
-            int count_aus = NUM_SAMPLES - pulse_end;
-            for (int i = pulse_end; i < NUM_SAMPLES; i++) {
-                sum_aus += samples[i];
+        } else {
+            // Fallback: altes Schwellenmodell
+            if (avg_an < lower_avg_threshold) {
+                pwm += pwm_step;
+                if (pwm > pwm_max) pwm = pwm_max;
+                uint16_t new_level = (uint16_t)(wrap * pwm);
+                pwm_set_gpio_level(PWM_GPIO, new_level);
+                printf("%.2f, PWM erhöht\n", pwm);
             }
-            float avg_aus = count_aus > 0 ? (float)sum_aus / count_aus * VperDev : 0.0f;
-
-            // Ausgabe der Ergebnisse
-        #if timestamping
-            // printf("Berechnungszeit: %.2f us\n",
-            //     time_us_32() - timestamps[NUM_SAMPLES-1]);
-
-            printf("%.2f, %d, %d, %d, %.2f, %.2f, %lu\n",
-                pwm, pulse_start, pulse_end, pulse_end - pulse_start, avg_an, avg_aus, pulse_time_us);
-        #else
-            printf("%.2f, %d, %d, %d, %.2f, %.2f\n",
-                pwm, pulse_start, pulse_end, pulse_end - pulse_start, avg_an, avg_aus);
-        #endif
-        } else {
-            printf("%.2f, Kein Puls erkannt, 0, 0, 0, 0, 0\n", pwm);
-            avg_an = 0.0f;  // Für Regelung weiter unten
-            
+            else if (avg_an > upper_avg_threshold) {
+                pwm -= pwm_step;
+                if (pwm < pwm_min) pwm = pwm_min;
+                uint16_t new_level = (uint16_t)(wrap * pwm);
+                pwm_set_gpio_level(PWM_GPIO, new_level);
+                printf("%.2f, PWM verringert\n", pwm);
+            } else {
+                printf("%.2f, PWM bleibt\n", pwm);
+            }
         }
-        
 
-        // === Regelung: Wenn Puls zu schwach oder nicht erkannt, erhöhe PWM ===
-        if (avg_an < lower_avg_threshold) {
-            pwm += pwm_step;
-            if (pwm > pwm_max) pwm = pwm_max;
-            uint16_t new_level = (uint16_t)(wrap * pwm);
-            pwm_set_gpio_level(PWM_GPIO, new_level);
-
-            printf("%.2f, PWM erhöht\n", pwm);
-        }
-        else if (avg_an > upper_avg_threshold) {
-            pwm -= pwm_step;
-            if (pwm < pwm_min) pwm = pwm_min;
-            uint16_t new_level = (uint16_t)(wrap * pwm);
-            pwm_set_gpio_level(PWM_GPIO, new_level);
-
-            printf("%.2f, PWM verringert\n", pwm);
-        } else {
-            printf("%.2f, PWM bleibt\n", pwm);
-        }
+        // Ausgabe der Ergebnisse
+        printf("%.2f, %.2f, %lu\n", pwm, avg_an, time_us_32());
     }
 }
 
-void startmessung(void) {
-    printf("Startmessung %lu\n");
+// -------------------------
+//  SICHERER PWM-START
+// -------------------------
+void init_safe_pwm_pin() {
+    gpio_set_function(PWM_GPIO, GPIO_FUNC_SIO);
+    gpio_set_dir(PWM_GPIO, GPIO_OUT);
+    gpio_put(PWM_GPIO, 0);     // Garantiert aus
+}
 
-    uint32_t start_time = time_us_32();
-
-    uint16_t start_samples[NUM_SAMPLES];
-    // 100 Messungen durchführen
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        start_samples[i] = adc_read();
+// -------------------------
+//  RUN PWM-SWEEP
+// -------------------------
+void run_pwm_sweep(){
+    printf("Bereit. Drücke Enter, um PWM-Sweep zu starten...\n");
+    while (true) {
+        int c = getchar_timeout_us(0);
+        if (c == '\r' || c == '\n') break;
     }
 
-    // Durchschnitt der Startmessung berechnen
-    uint32_t summe = 0;
-    for (int i = 0; i < NUM_SAMPLES; i++) {
-        summe += start_samples[i];
-    }
-    float avg = summe / NUM_SAMPLES * VperDev;
+    printf("Starte Sweep...\n");
 
-    printf("Durchschnitt: %.2f mV, Zeit: %lu us\n", avg, time_us_32()- start_time);
+    static float sweep_results[MAX_DUTY_CYCLE + 1];
+
+    pwm_sweep(sweep_results);
+    save_results_to_flash(sweep_results, MAX_DUTY_CYCLE + 1);
+
+    printf("Sweep beendet! Werte gespeichert.\n");
+
+    for (int i = 0; i <= MAX_DUTY_CYCLE; i++)
+        printf("%d, %.3f\n", i, sweep_results[i]);
+}
+
+// -------------------------
+//  PWM-SWEEP AUSGELAGERT
+// -------------------------
+void pwm_sweep(float *result_array) {
+
+    const float sys_clk = 125000000;
+    float freq = 1000.0f;
+    float clkdiv = 125.0f;
+    uint16_t _wrap = (uint16_t)((sys_clk / clkdiv) / freq) - 1;
+
+    uint slice_num = pwm_gpio_to_slice_num(PWM_GPIO);
+    uint channel   = pwm_gpio_to_channel(PWM_GPIO);
+
+    // Erst hier PWM aktivieren!
+    gpio_set_function(PWM_GPIO, GPIO_FUNC_PWM);
+    pwm_set_wrap(slice_num, _wrap);
+    pwm_set_clkdiv(slice_num, clkdiv);
+    pwm_set_enabled(slice_num, true);
+
+    for (int duty = 0; duty <= MAX_DUTY_CYCLE; duty++) {
+
+        uint16_t level = (_wrap * duty) / MAX_DUTY_CYCLE;
+        pwm_set_chan_level(slice_num, channel, level);
+
+        sleep_ms(20);
+
+        uint64_t sum = 0;
+        for (int i = 0; i < SAMPLES_PER_STEP; i++)
+            sum += adc_read();
+
+        float avg_adc = (float)sum / SAMPLES_PER_STEP;
+        result_array[duty] = avg_adc * VperDev;
+    }
+
+    // Nach Sweep PWM wieder komplett abschalten
+    pwm_set_enabled(slice_num, false);
+    gpio_set_function(PWM_GPIO, GPIO_FUNC_SIO);
+    gpio_set_dir(PWM_GPIO, GPIO_OUT);
+    gpio_put(PWM_GPIO, 0);  // DEAD-SAFE
+}
+
+// -------------------------
+// FLASH-Speicher-Funktionen
+// -------------------------
+void save_results_to_flash(float *values, size_t count) {
+
+    // uint32_t ints = save_and_disable_interrupts();
+
+    // prepare header
+    flash_table_header_t header;
+    header.magic = FLASH_TABLE_MAGIC;
+    header.count = (uint32_t)count;
+    header.reserved = 0;
+    // checksum over float data
+    uint32_t checksum = compute_checksum((const uint8_t*)values, count * sizeof(float));
+    header.checksum = checksum;
+
+    flash_range_erase(FLASH_TARGET_OFFSET, 4096);
+
+    // write header
+    flash_range_program(FLASH_TARGET_OFFSET, (const uint8_t*)&header, sizeof(header));
+
+    // write payload (floats) immediately after header
+    flash_range_program(FLASH_TARGET_OFFSET + sizeof(header), (const uint8_t*)values, count * sizeof(float));
+
+    // restore_interrupts(ints);
+}
+
+bool load_results_from_flash(float *buffer, size_t count) {
+    const uint8_t *flash_ptr = (const uint8_t *)(XIP_BASE + FLASH_TARGET_OFFSET);
+
+    // Try new header format first
+    if (sizeof(flash_table_header_t) <= 4096) {
+        const flash_table_header_t *h = (const flash_table_header_t *)flash_ptr;
+        if (h->magic == FLASH_TABLE_MAGIC && h->count == (uint32_t)count) {
+            const uint8_t *data_ptr = flash_ptr + sizeof(flash_table_header_t);
+            uint32_t cs = compute_checksum(data_ptr, count * sizeof(float));
+            if (cs == h->checksum) {
+                memcpy(buffer, data_ptr, count * sizeof(float));
+                return true;
+            }
+        }
+    }
+
+    // Legacy fallback: try to interpret start of flash region as raw float array
+    // Validate values are in plausible range (>=0 and < 5000)
+    const float *maybe_floats = (const float *)flash_ptr;
+    bool ok = true;
+    for (size_t i = 0; i < count; ++i) {
+        float v = maybe_floats[i];
+        if (!(v >= 0.0f && v < 5000.0f)) { ok = false; break; }
+    }
+    if (ok) {
+        memcpy(buffer, maybe_floats, count * sizeof(float));
+        return true;
+    }
+
+    return false;
 }
